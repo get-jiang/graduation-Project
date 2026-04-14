@@ -9,6 +9,7 @@
 #include "csr_graph.h"
 #include "support.h"
 #include "wl.h"
+#include "bucket_update_optimizations.cuh"
 
 #define TB_SIZE 768
 //768
@@ -28,7 +29,7 @@ __global__ void kernel(CSRGraph graph, int src) {
 }
 #define HOR_EDGE 16
 __launch_bounds__(896, 1)
-__global__ void sssp_kernel(CSRGraph graph, worklist wl, unsigned* work_count) {
+__global__ void sssp_kernel(CSRGraph graph, worklist wl, unsigned* work_count, unsigned* registered_bucket) {
 	wl.init_regular();
 
 	unsigned tid = thread_id_x() + block_id_x() * block_dim_x();
@@ -77,9 +78,7 @@ __global__ void sssp_kernel(CSRGraph graph, worklist wl, unsigned* work_count) {
 				node_data_type new_dist = cub::ThreadLoad<cub::LOAD_CG>(&(graph.node_data[leader_vertex])) + wt;
 				node_data_type dst_dist = cub::ThreadLoad<cub::LOAD_CG>(&(graph.node_data[dst]));
 				if (dst_dist > new_dist) {
-					atomicMin(&(graph.node_data[dst]), new_dist);
-					unsigned dst_bag_id = wl.dist_to_bag_id_int(src_bag_id, new_dist);
-					wl.push_work(dst_bag_id, dst);
+					relax_edge_batched(graph, wl, src_bag_id, dst, new_dist, registered_bucket);
 				}
 			}
 			process_mask = set_bits(process_mask, 0, leader, 1);
@@ -116,9 +115,7 @@ __global__ void sssp_kernel(CSRGraph graph, worklist wl, unsigned* work_count) {
 				node_data_type new_dist = cub::ThreadLoad<cub::LOAD_CG>(&(graph.node_data[leader_vertex])) + wt;
 				node_data_type dst_dist = cub::ThreadLoad<cub::LOAD_CG>(&(graph.node_data[dst]));
 				if (dst_dist > new_dist) {
-					atomicMin(&(graph.node_data[dst]), new_dist);
-					unsigned dst_bag_id = wl.dist_to_bag_id_int(src_bag_id, new_dist);
-					wl.push_work(dst_bag_id, dst);
+					relax_edge_batched(graph, wl, src_bag_id, dst, new_dist, registered_bucket);
 				}
 			}
 		}
@@ -128,7 +125,7 @@ __global__ void sssp_kernel(CSRGraph graph, worklist wl, unsigned* work_count) {
 	}
 }
 
-__global__ void driver_kernel(int num_tb, int num_threads, worklist wl, CSRGraph gg, uint start_node, unsigned* work_count) {
+__global__ void driver_kernel(int num_tb, int num_threads, worklist wl, CSRGraph gg, uint start_node, unsigned* work_count, unsigned* registered_bucket) {
 
 	cudaStream_t s1;
 	cudaStreamCreateWithFlags(&s1, cudaStreamNonBlocking);
@@ -136,21 +133,21 @@ __global__ void driver_kernel(int num_tb, int num_threads, worklist wl, CSRGraph
 
 	cudaStream_t s2;
 	cudaStreamCreateWithFlags(&s2, cudaStreamNonBlocking);
-	sssp_kernel<<<num_tb, num_threads, 0, s2>>>(gg, wl, work_count);
+	sssp_kernel<<<num_tb, num_threads, 0, s2>>>(gg, wl, work_count, registered_bucket);
 
 }
 
-void gg_main_pipe_1_wrapper(CSRGraph& hg, CSRGraph& gg, uint start_node, int num_tb, int num_threads, worklist wl, unsigned* work_count) {
+void gg_main_pipe_1_wrapper(CSRGraph& hg, CSRGraph& gg, uint start_node, int num_tb, int num_threads, worklist wl, unsigned* work_count, unsigned* registered_bucket) {
 	// gg_main_pipe_1_gpu<<<1,1>>>(gg,glevel,curdelta,i,DELTA,remove_dups_barrier,remove_dups_blocks,pipe,blocks,threads,cl_curdelta,cl_i, enable_lb);
 	//gg_cg_gb<<<gg_main_pipe_1_gpu_gb_blocks, __tb_gg_main_pipe_1_gpu_gb>>>(
 	//		gg, glevel, curdelta, i, DELTA, pipe, cl_curdelta, cl_i, enable_lb);
 
-	driver_kernel<<<1, 1>>>(num_tb, num_threads, wl, gg, start_node, work_count);
+	driver_kernel<<<1, 1>>>(num_tb, num_threads, wl, gg, start_node, work_count, registered_bucket);
 	cudaDeviceSynchronize();
 }
 
 // 在 gg_main 中修改
-void gg_main_pipe_1_wrapper_tmp(CSRGraph& hg, CSRGraph& gg, uint start_node, int num_tb, int num_threads, worklist wl, unsigned* work_count) {
+void gg_main_pipe_1_wrapper_tmp(CSRGraph& hg, CSRGraph& gg, uint start_node, int num_tb, int num_threads, worklist wl, unsigned* work_count, unsigned* registered_bucket) {
     // 1. 创建两个独立的流
     cudaStream_t s_mgmt, s_comp;
     cudaStreamCreateWithFlags(&s_mgmt, cudaStreamNonBlocking);
@@ -161,7 +158,7 @@ void gg_main_pipe_1_wrapper_tmp(CSRGraph& hg, CSRGraph& gg, uint start_node, int
     // 2. 分别在两个流中启动，不需要 driver_kernel
     // 这种启动方式让驱动程序更容易平衡资源
     wl_kernel<<<1, 192, 0, s_mgmt>>>(wl, start_node);
-    sssp_kernel<<<num_tb, num_threads, 0, s_comp>>>(gg, wl, work_count);
+    sssp_kernel<<<num_tb, num_threads, 0, s_comp>>>(gg, wl, work_count, registered_bucket);
 
     // 3. 同步
     cudaDeviceSynchronize();
@@ -233,7 +230,9 @@ void gg_main(CSRGraph& hg, CSRGraph& gg) {
 	unsigned suggest_size = (unsigned)((float)hg.nedges * WL_SIZE_MUL) + (NUM_BAG * BLOCK_SIZE * 8);
 	suggest_size = min(suggest_size, 536870912);
 	unsigned* work_count;
+	unsigned* registered_bucket;
 	cudaMalloc((void **) &work_count, num_tb * num_threads * sizeof(unsigned));
+	cudaMalloc((void **) &registered_bucket, hg.nnodes * sizeof(unsigned));
 
 #define RUN_LOOP 8
 
@@ -258,6 +257,7 @@ void gg_main(CSRGraph& hg, CSRGraph& gg) {
 		}
 
 		cudaMemset(work_count, 0, num_tb * num_threads * sizeof(unsigned));
+		cudaMemset(registered_bucket, 0xFF, hg.nnodes * sizeof(unsigned));
 		wl.reinit();
 		cudaDeviceSynchronize();
 
@@ -296,7 +296,7 @@ void gg_main(CSRGraph& hg, CSRGraph& gg) {
 			ave_wt /= other_num_tb;
 		}
 		wl.set_param(ave_wt, ave_degree);
-		gg_main_pipe_1_wrapper(hg, gg, start_node, num_tb, num_threads, wl, work_count);
+		gg_main_pipe_1_wrapper(hg, gg, start_node, num_tb, num_threads, wl, work_count, registered_bucket);
 
 		printf("DEBUG\n");
         // ============ 插入这段 DEBUG 代码 ============
@@ -341,6 +341,7 @@ void gg_main(CSRGraph& hg, CSRGraph& gg) {
 	fprintf(d3, "%s %.3f %llu\n", hg.file_name, ave_time, ave_work);
 	wl.free();
 	cudaFree(work_count);
+	cudaFree(registered_bucket);
 	fclose(d3);
 
 //clean up
